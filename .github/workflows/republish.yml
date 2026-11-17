@@ -1,0 +1,317 @@
+name: Mirror upstream NagramXF build
+
+# ---------------------------------------------------------------------------
+# WHY THIS EXISTS
+#
+# Upstream (Keeperorowner/NagramXF) builds every push to `dev` / `canary` in
+# GitHub Actions, but:
+#   * the last GitHub Release is 12.10.1.1251 (14 Sep 2026) while `dev` is on
+#     13.2.1 / upstream Telegram code 7291;
+#   * the workflow's `upload:` job (the one that pushed APKs to the Telegram
+#     channels) is fully commented out;
+#   * `permissions: contents: read` means the upstream workflow structurally
+#     cannot create a Release even if someone wanted it to.
+# So the only output is an Actions *artifact*: one ~265 MB ZIP with 4 APKs,
+# downloadable only by a logged-in GitHub user. Obtainium cannot watch that.
+#
+# WHAT THIS DOES
+#
+# Mirrors that artifact into THIS repo as a normal GitHub Release holding one
+# ~59 MB APK, which Obtainium can track like any other app.
+#
+# It does NOT rebuild anything. The bytes come from the maintainer's own CI and
+# are signed with the keystore committed upstream at
+# TMessagesProj/release.keystore. That keystore's certificate is byte-identical
+# to the signer of the official 12.10.1.1251 release APK:
+#   sha256 1a05a230b7d3c4703c79a5baf872396112669c4d716474be6f9e8247a54c4563
+# Therefore the mirrored APK installs straight over the app you already have -
+# no uninstall, no data loss. Building in your own fork would NOT have this
+# property, because the keystore password only exists in the maintainer's CI
+# secrets, so your fork would produce a differently-signed APK.
+#
+# SETUP - a NEW standalone repo, NOT a fork (this matters, see below)
+#
+#   1. Create a new empty PUBLIC repo, e.g. `nagramxf-mirror`. Public is what
+#      makes Actions minutes unlimited.
+#   2. Put this whole folder in it, so you end up with:
+#        .github/workflows/republish.yml
+#        tools/extract_from_remote_zip.py
+#        tools/verify_signer.py
+#        state.json          <- contains {}
+#        README.md
+#      The workflow file MUST be on the DEFAULT branch: GitHub only evaluates
+#      `schedule:` triggers from there.
+#   3. Actions tab -> enable workflows if prompted.
+#   4. Optional: fine-grained PAT scoped to THIS repo, Contents: read and write,
+#      stored as secret MIRROR_TOKEN. The default GITHUB_TOKEN works fine.
+#   5. Actions -> "Mirror upstream NagramXF build" -> Run workflow.
+#   6. In Obtainium add https://github.com/<you>/nagramxf-mirror
+#
+# WHY NOT A FORK of Keeperorowner/NagramXF
+#
+#   * Scheduled workflows are DISABLED BY DEFAULT IN FORKS (GitHub reports the
+#     workflow state as `disabled_fork`). This whole design is schedule-driven,
+#     so a fork silently does nothing until you enable Actions by hand.
+#   * Forks never receive upstream commits on their own - "Sync fork" is always
+#     a manual action. And here syncing would be pointless anyway: this workflow
+#     does not compile anything from your checkout. It reads the artifact that
+#     UPSTREAM's CI produced, so the freshness comes from upstream, not from you.
+#   * A fork drags in ~hundreds of MB of Telegram source you never touch, and
+#     "Sync fork" starts conflicting with the `state.json` commits this workflow
+#     makes on your default branch.
+#
+#   The ONLY thing this repo needs from upstream is its public artifact URL.
+#   GPL-3.0 attribution for Nagram XF lives in README.md; this repo redistributes
+#   the upstream binaries unmodified, which is exactly what the license permits.
+#
+# COST PER RUN: ~59 MB in, ~59 MB out. Range requests skip the other three ABIs
+# and the universal APK, so you never touch the full 253 MB artifact.
+# ---------------------------------------------------------------------------
+
+on:
+  schedule:
+    # Every 30 minutes. Cheap in practice: a run that finds no new upstream build
+    # only does one `gh api` call plus a ~59 MB fetch, and the "did it change?"
+    # gate stops before publishing. Public-repo Actions minutes are unlimited.
+    #
+    # Reality check on latency, worst case:
+    #   upstream build itself      14-30 min  (NDK/CMake/Chaquopy, not ours to speed up)
+    #   + this cron                up to 30 min
+    #   + GitHub scheduler delay   15-60 min under load (GitHub does not guarantee cron punctuality)
+    #   + Obtainium check interval whatever you set in Obtainium
+    # So "after every commit" in practice means "within roughly an hour of the
+    # build finishing", not "instantly".
+    - cron: '13,43 * * * *'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'staging = dev branch (what the beta channel used). canary = canary branch.'
+        required: true
+        default: 'staging'
+        type: choice
+        options: [staging, canary]
+      flavor:
+        description: 'normal = no plugin runtime, has x86_64. plugin = Python plugin support, arm only.'
+        required: true
+        default: 'normal'
+        type: choice
+        options: [normal, plugin]
+      abi_regex:
+        description: 'Regex selecting one APK inside the artifact ZIP'
+        required: true
+        default: 'normal-arm64-v8a\.apk$'
+      rolling_tag:
+        description: 'false = one release per build (Obtainium sees each build, needs pruning). true = one rolling release, asset overwritten.'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+
+permissions:
+  contents: write   # create/update releases + commit state.json
+
+concurrency:
+  group: republish
+  cancel-in-progress: false
+
+env:
+  CHANNEL: ${{ inputs.channel || 'staging' }}
+  FLAVOR: ${{ inputs.flavor || 'normal' }}
+  ABI_REGEX: ${{ inputs.abi_regex || 'normal-arm64-v8a\.apk$' }}
+  ROLLING: ${{ inputs.rolling_tag || 'false' }}
+  EXPECTED_CERT_SHA256: 1a05a230b7d3c4703c79a5baf872396112669c4d716474be6f9e8247a54c4563
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Resolve upstream artifact
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$FLAVOR" = "plugin" ]; then
+            ART="plugin-$CHANNEL"
+          else
+            ART="normal-$CHANNEL"
+          fi
+          case "$CHANNEL" in
+            staging) WF=staging.yml; BR=dev ;;
+            canary)  WF=canary.yml;  BR=canary ;;
+            *) echo "unknown channel: $CHANNEL" >&2; exit 1 ;;
+          esac
+
+          RUN_ID=""; RUN_SHA=""
+          JSON=$(gh api "repos/Keeperorowner/NagramXF/actions/workflows/$WF/runs?branch=$BR&status=completed&conclusion=success&per_page=1" 2>/dev/null || true)
+          if [ -n "$JSON" ]; then
+            RUN_ID=$(printf '%s' "$JSON" | jq -r '.workflow_runs[0].id // empty')
+            RUN_SHA=$(printf '%s' "$JSON" | jq -r '.workflow_runs[0].head_sha // empty')
+          fi
+          [ -n "$RUN_ID" ] || RUN_ID=unknown
+          [ -n "$RUN_SHA" ] || RUN_SHA=unknown
+
+          # nightly.link proxies public Actions artifacts without auth and
+          # honours Range requests, which is what makes single-file extraction
+          # out of a 265 MB ZIP possible.
+          URL="https://nightly.link/Keeperorowner/NagramXF/workflows/$WF/$BR/$ART.zip"
+
+          {
+            echo "url=$URL"
+            echo "artifact=$ART"
+            echo "workflow=$WF"
+            echo "branch=$BR"
+            echo "run_id=$RUN_ID"
+            echo "run_sha=$RUN_SHA"
+          } >> "$GITHUB_OUTPUT"
+          echo "artifact=$ART branch=$BR upstream_run=$RUN_ID upstream_sha=$RUN_SHA"
+
+          # Upstream can go quiet (its releases already stalled on 2026-09-14 and
+          # its Telegram channels on 2026-10-05). nightly.link always serves the
+          # LAST SUCCESSFUL run, so a stale build looks identical to a fresh one.
+          # Warn loudly in the job summary instead of failing.
+          if [ "$RUN_ID" != "unknown" ]; then
+            RUN_TS=$(printf '%s' "$JSON" | jq -r '.workflow_runs[0].updated_at // empty')
+            if [ -n "$RUN_TS" ]; then
+              AGE_DAYS=$(( ( $(date -u +%s) - $(date -u -d "$RUN_TS" +%s) ) / 86400 ))
+              echo "upstream build age: ${AGE_DAYS}d"
+              if [ "$AGE_DAYS" -gt 14 ]; then
+                echo "### :warning: Upstream build is ${AGE_DAYS} days old" >> "$GITHUB_STEP_SUMMARY"
+                echo "Last successful upstream run: $RUN_TS ($RUN_ID). Upstream may have stopped building." >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+          fi
+
+      - name: Extract only the wanted APK (range requests)
+        id: extract
+        run: |
+          set -euo pipefail
+          python3 tools/extract_from_remote_zip.py \
+            "${{ steps.resolve.outputs.url }}" \
+            "$ABI_REGEX" \
+            bundle.zip > apk.sha
+          SHA=$(tail -n1 apk.sha)
+          APK=$(python3 -c "import zipfile;print(zipfile.ZipFile('bundle.zip').namelist()[0])")
+          unzip -o -q bundle.zip
+          ls -lh "$APK"
+          {
+            echo "sha=$SHA"
+            echo "apk=$APK"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify signer matches the official NagramXF key
+        run: |
+          set -euo pipefail
+          python3 tools/verify_signer.py "${{ steps.extract.outputs.apk }}" "$EXPECTED_CERT_SHA256"
+
+      - name: Check whether the build actually changed
+        id: gate
+        run: |
+          set -euo pipefail
+          NEW="${{ steps.extract.outputs.sha }}"
+          KEY="$CHANNEL/$FLAVOR/$ABI_REGEX"
+          OLD=$(jq -r --arg k "$KEY" '.[$k] // empty' state.json 2>/dev/null || true)
+          if [ "$OLD" = "$NEW" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "unchanged ($NEW) - skipping publish"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "old=${OLD:-<none>} new=$NEW"
+          fi
+
+      - name: Publish to a release in this repo
+        if: steps.gate.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_TOKEN || secrets.GITHUB_TOKEN }}
+          APK: ${{ steps.extract.outputs.apk }}
+          SHA: ${{ steps.extract.outputs.sha }}
+          RUN_ID: ${{ steps.resolve.outputs.run_id }}
+          RUN_SHA: ${{ steps.resolve.outputs.run_sha }}
+          WF: ${{ steps.resolve.outputs.workflow }}
+          BR: ${{ steps.resolve.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # NagramXF-v13.2.1-37a3538(1252)-normal-arm64-v8a.apk
+          VER=$(printf '%s' "$APK"     | sed -E 's/^NagramXF-v([^-]+)-.*/\1/')
+          C7=$(printf '%s' "$APK"      | sed -E 's/^NagramXF-v[^-]+-([0-9a-f]{7}).*/\1/')
+          VCODE=$(printf '%s' "$APK"   | sed -E 's/.*\(([0-9]+)\).*/\1/')
+
+          cat > notes.md <<EOF
+          Mirrored from upstream GitHub Actions. Not rebuilt, not re-signed.
+
+          - Upstream: https://github.com/Keeperorowner/NagramXF
+          - Workflow: \`$WF\` on branch \`$BR\` ($CHANNEL/$FLAVOR)
+          - Run: https://github.com/Keeperorowner/NagramXF/actions/runs/$RUN_ID
+          - Commit: https://github.com/Keeperorowner/NagramXF/commit/$RUN_SHA
+          - Version: $VER (versionCode $VCODE), build $C7
+          - APK sha256: \`$SHA\`
+          - Signer cert sha256: \`$EXPECTED_CERT_SHA256\` (same key as official releases)
+          EOF
+          sed -i 's/^          //' notes.md
+          cat notes.md
+
+          if [ "$ROLLING" = "true" ]; then
+            TAG="nagramxf-$CHANNEL-$FLAVOR-latest"
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" "$APK" --clobber
+              gh release edit "$TAG" --notes-file notes.md \
+                --title "NagramXF $VER ($VCODE) $CHANNEL/$FLAVOR [rolling]"
+            else
+              gh release create "$TAG" "$APK" --prerelease \
+                --title "NagramXF $VER ($VCODE) $CHANNEL/$FLAVOR [rolling]" \
+                --notes-file notes.md
+            fi
+            echo "published -> $TAG"
+          else
+            TAG="ci-$VER-$C7-$(date -u +%Y%m%d%H%M%S)"
+            gh release create "$TAG" "$APK" --prerelease \
+              --title "NagramXF $VER ($VCODE) $CHANNEL/$FLAVOR $C7" \
+              --notes-file notes.md
+            echo "published -> $TAG"
+          fi
+
+      - name: Prune old mirrored releases
+        if: steps.gate.outputs.changed == 'true' && env.ROLLING == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_TOKEN || secrets.GITHUB_TOKEN }}
+          KEEP: '20'
+        run: |
+          set -euo pipefail
+          # One release per build means assets pile up at ~59 MB each. Keep the
+          # newest $KEEP and delete the rest, so Obtainium can still fall back to
+          # an older build while the repo does not grow without bound.
+          gh release list --limit 300 --json tagName,createdAt \
+            | jq -r '[.[] | select(.tagName | startswith("ci-"))]
+                     | sort_by(.createdAt) | reverse | .[].tagName' \
+            | tail -n +$((KEEP + 1)) > old.txt || true
+          N=$(wc -l < old.txt)
+          echo "pruning $N release(s), keeping newest $KEEP"
+          while read -r TAG; do
+            [ -n "$TAG" ] || continue
+            gh release delete "$TAG" --yes --cleanup-tag || echo "  could not delete $TAG"
+          done < old.txt
+
+      - name: Record state
+        if: steps.gate.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          KEY="$CHANNEL/$FLAVOR/$ABI_REGEX"
+          [ -f state.json ] || echo '{}' > state.json
+          jq --arg k "$KEY" --arg v "${{ steps.extract.outputs.sha }}" '.[$k]=$v' state.json > s.tmp
+          mv s.tmp state.json
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: record mirrored build ${{ steps.extract.outputs.sha }}"
+            git push
+          fi
