@@ -120,8 +120,8 @@ python3 tools/verify_signer.py NagramXF-v13.2.1-37a3538\(1252\)-plugin-arm64-v8a
   `**.md` и `.github/**`.
 - **Две ветки — два потока.** `dev` → Staging build, `canary` → Canary build,
   одна и та же правка может попасть в обе с разным SHA и разницей в дни.
-  Это зеркало подписано на `staging` (`dev`); не подписывайтесь на оба.
-- **Стабильность.** Это `dev`, а не релизы: регрессии случаются, примеры
+  Это зеркало подписано на `canary`; не подписывайтесь на оба.
+- **Стабильность.** Это `canary`, а не релизы: регрессии случаются, примеры
   свежих — [#205](https://github.com/Keeperorowner/NagramXF/issues/205)
   и [#196](https://github.com/Keeperorowner/NagramXF/issues/196).
 - **Play Protect** может ругаться на установку:
