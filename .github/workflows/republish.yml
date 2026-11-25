@@ -219,14 +219,89 @@ jobs:
           set -euo pipefail
           NEW="${{ steps.extract.outputs.sha }}"
           KEY="$CHANNEL/$FLAVOR/$ABI_REGEX"
-          OLD=$(jq -r --arg k "$KEY" '.[$k] // empty' state.json 2>/dev/null || true)
+          # state.json values are objects since the changelog feature; the
+          # first runs of this repo stored a bare apk sha string - read both.
+          OLD=$(jq -r --arg k "$KEY" '(.[$k] // empty) | if type=="object" then .apk else . end' state.json 2>/dev/null || true)
+          OLD_UP=$(jq -r --arg k "$KEY" '(.[$k] // empty) | if type=="object" then (.upstream // empty) else empty end' state.json 2>/dev/null || true)
           if [ "$OLD" = "$NEW" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "unchanged ($NEW) - skipping publish"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "old=${OLD:-<none>} new=$NEW"
+            echo "old_up=$OLD_UP" >> "$GITHUB_OUTPUT"
+            echo "old=${OLD:-<none>} new=$NEW old_upstream=${OLD_UP:-<none>}"
           fi
+
+      - name: Collect changelog since the previous mirrored build
+        if: steps.gate.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_TOKEN || secrets.GITHUB_TOKEN }}
+          PREV_UP: ${{ steps.gate.outputs.old_up }}
+          RUN_SHA: ${{ steps.resolve.outputs.run_sha }}
+        run: |
+          set -euo pipefail
+          # Runs only when a publish is going to happen, so idle cron runs
+          # still cost zero extra API calls.
+          UPOWN=Keeperorowner/NagramXF
+          SHOW_MAX=30
+          RECOVERED=0
+          # Legacy state.json (bare apk sha strings, as written before this
+          # feature) carries no upstream sha. Recover the comparison base from
+          # the previous release of this stream: its notes quote the commit.
+          if [ -z "$PREV_UP" ]; then
+            PREV_UP=$(gh release list --limit 10 --json body 2>/dev/null \
+              | jq -r --arg sig "($CHANNEL/$FLAVOR)" '.[] | select(.body | contains($sig)) | .body' \
+              | grep -m1 -oE 'commit/[0-9a-f]{40}' | cut -d/ -f2 || true)
+            [ -n "$PREV_UP" ] && RECOVERED=1
+          fi
+          {
+            if [ -z "$PREV_UP" ]; then
+              echo "### What changed"
+              echo
+              echo "First mirrored build of this stream ($CHANNEL/$FLAVOR): there is"
+              echo "no earlier mirrored build to compare against yet. From here on,"
+              echo "every release lists the upstream commits added since the previous"
+              echo "mirrored build of the same stream."
+            else
+              echo "### What changed since the previous mirrored build"
+              echo
+              if [ "$RECOVERED" = "1" ]; then
+                echo "(comparison base recovered from the previous release's notes)"
+                echo
+              fi
+              echo "From [\`${PREV_UP:0:7}\`](https://github.com/$UPOWN/commit/$PREV_UP)"
+              echo "to [\`${RUN_SHA:0:7}\`](https://github.com/$UPOWN/commit/$RUN_SHA):"
+              echo
+              if CMP=$(gh api "repos/$UPOWN/compare/${PREV_UP}...${RUN_SHA}" 2>/dev/null); then
+                TOTAL=$(printf '%s' "$CMP" | jq -r '.total_commits // 0')
+                STATUS=$(printf '%s' "$CMP" | jq -r '.status // "unknown"')
+                LIST=$(printf '%s' "$CMP" \
+                  | jq -r --arg repo "$UPOWN" '
+                      .commits[]
+                      | select(.commit.message | startswith("Merge ") | not)
+                      | "- [`\(.sha[0:7])`](https://github.com/\($repo)/commit/\(.sha)) "
+                        + (.commit.message | split("\n")[0])')
+                SHOWN=$(printf '%s\n' "$LIST" | grep -c . || true)
+                if [ "$STATUS" = "diverged" ]; then
+                  echo "(histories diverged; listing commits reachable from the new build only)"
+                  echo
+                fi
+                if [ "$SHOWN" -eq 0 ]; then
+                  echo "No non-merge commits in this range ($TOTAL commit(s) total, all merges)."
+                else
+                  printf '%s\n' "$LIST" | head -n "$SHOW_MAX"
+                  if [ "$SHOWN" -gt "$SHOW_MAX" ]; then
+                    echo
+                    echo "... and $((SHOWN - SHOW_MAX)) more: https://github.com/$UPOWN/compare/${PREV_UP:0:7}...${RUN_SHA:0:7}"
+                  fi
+                fi
+              else
+                echo "GitHub API did not return the commit list this time;"
+                echo "compare manually: https://github.com/$UPOWN/compare/${PREV_UP:0:7}...${RUN_SHA:0:7}"
+              fi
+            fi
+          } > changelog.md
+          cat changelog.md
 
       - name: Publish to a release in this repo
         if: steps.gate.outputs.changed == 'true'
@@ -257,6 +332,9 @@ jobs:
           - Signer cert sha256: \`$EXPECTED_CERT_SHA256\` (same key as official releases)
           EOF
           sed -i 's/^          //' notes.md
+          if [ -s changelog.md ]; then
+            { echo; cat changelog.md; } >> notes.md
+          fi
           cat notes.md
 
           if [ "$ROLLING" = "true" ]; then
@@ -302,11 +380,16 @@ jobs:
 
       - name: Record state
         if: steps.gate.outputs.changed == 'true'
+        env:
+          RUN_SHA: ${{ steps.resolve.outputs.run_sha }}
         run: |
           set -euo pipefail
           KEY="$CHANNEL/$FLAVOR/$ABI_REGEX"
           [ -f state.json ] || echo '{}' > state.json
-          jq --arg k "$KEY" --arg v "${{ steps.extract.outputs.sha }}" '.[$k]=$v' state.json > s.tmp
+          # object value: apk sha (the publish gate) + upstream commit sha
+          # (the comparison base for the next release's changelog)
+          jq --arg k "$KEY" --arg v "${{ steps.extract.outputs.sha }}" --arg u "$RUN_SHA" \
+            '.[$k]={apk:$v, upstream:$u}' state.json > s.tmp
           mv s.tmp state.json
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
