@@ -87,19 +87,19 @@ on:
       channel:
         description: 'staging = dev branch (what the beta channel used). canary = canary branch.'
         required: true
-        default: 'staging'
+        default: 'canary'
         type: choice
         options: [staging, canary]
       flavor:
         description: 'normal = no plugin runtime, has x86_64. plugin = Python plugin support, arm only.'
         required: true
-        default: 'plugin'
+        default: 'normal'
         type: choice
         options: [normal, plugin]
       abi_regex:
         description: 'Regex selecting one APK inside the artifact ZIP'
         required: true
-        default: 'plugin-arm64-v8a\.apk$'
+        default: 'normal-arm64-v8a\.apk$'
       rolling_tag:
         description: 'false = one release per build (Obtainium sees each build, needs pruning). true = one rolling release, asset overwritten.'
         required: true
@@ -115,9 +115,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  CHANNEL: ${{ inputs.channel || 'staging' }}
-  FLAVOR: ${{ inputs.flavor || 'plugin' }}
-  ABI_REGEX: ${{ inputs.abi_regex || 'plugin-arm64-v8a\.apk$' }}
+  CHANNEL: ${{ inputs.channel || 'canary' }}
+  FLAVOR: ${{ inputs.flavor || 'normal' }}
+  ABI_REGEX: ${{ inputs.abi_regex || 'normal-arm64-v8a\.apk$' }}
   ROLLING: ${{ inputs.rolling_tag || 'false' }}
   EXPECTED_CERT_SHA256: 1a05a230b7d3c4703c79a5baf872396112669c4d716474be6f9e8247a54c4563
 
