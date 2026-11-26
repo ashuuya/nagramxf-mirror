@@ -2,7 +2,7 @@
   "staging/normal/normal-arm64-v8a\\.apk$": "b9f32842865c34ac48ad75f635f71c98d0092c2288730163e2920f2acc7d3192",
   "staging/plugin/plugin-arm64-v8a\\.apk$": "df84c667f49a209ffa7937b8a417046d5cadc9a9c5d42f8068ce40e1eaa96fcb",
   "canary/normal/normal-arm64-v8a\\.apk$": {
-    "apk": "6941308fcbef1048c25717340bd7001d9b11e6ae8bbc5b1de7eaad16fa24aa41",
-    "upstream": "e099efb58412ceb1f0fbb1a7f38d7b2009016d14"
+    "apk": "1f822ca37fa782230e9bbdb1429e00055b8e6b08166c7ebaaaa20fecdb31dd59",
+    "upstream": "535d7d9b9e8572733633dd5046dcc9931f00dd41"
   }
 }
